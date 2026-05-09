@@ -350,7 +350,7 @@
   });
 
   function sendSuggestion(btn) {
-    userInput.value = btn.textContent.replace(/^[\u{1F000}-\u{FFFF}]+\s*/u, '').trim();
+    userInput.value = btn.textContent.replace(/^\p{Extended_Pictographic}+\s*/u, '').trim();
     document.getElementById('suggestions').remove();
     sendMessage();
   }

@@ -1,12 +1,19 @@
+import os
+import logging
+from typing import List
+
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import List
-import os
-import httpx
 
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("dr-alma")
+
+# ── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Agente Psicólogo IA")
 
 app.add_middleware(
@@ -17,9 +24,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = "llama-3.3-70b-versatile"
+# ── Config ───────────────────────────────────────────────────────────────────
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_MODEL   = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
 SYSTEM_PROMPT = """Eres un psicólogo empático, cálido y profesional llamado Dr. Alma. Tu rol es:
 
@@ -41,6 +51,7 @@ Reglas importantes:
 Recuerda: tu misión es crear un espacio seguro donde el usuario se sienta escuchado y comprendido."""
 
 
+# ── Modelos Pydantic ─────────────────────────────────────────────────────────
 class Message(BaseModel):
     role: str
     content: str
@@ -53,13 +64,29 @@ class ChatResponse(BaseModel):
     model: str
 
 
+# ── Rutas API (DEFINIR ANTES del mount de StaticFiles) ───────────────────────
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "model": GROQ_MODEL,
+        "groq_key_configured": bool(GROQ_API_KEY),
+    }
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     if not GROQ_API_KEY:
+        logger.error("GROQ_API_KEY no configurada")
         raise HTTPException(status_code=500, detail="GROQ_API_KEY no configurada en el servidor.")
+
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="No se enviaron mensajes.")
 
     groq_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for msg in request.messages:
+        if msg.role not in ("user", "assistant"):
+            continue
         groq_messages.append({"role": msg.role, "content": msg.content})
 
     payload = {
@@ -69,33 +96,45 @@ async def chat(request: ChatRequest):
         "max_tokens": 600,
         "stream": False,
     }
-
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(GROQ_API_URL, json=payload, headers=headers)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=502, detail=f"Error de Groq API: {e.response.text}")
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=503, detail=f"No se pudo conectar con Groq: {str(e)}")
 
-    data = response.json()
-    reply = data["choices"][0]["message"]["content"]
-    return ChatResponse(reply=reply, model=GROQ_MODEL)
+        if response.status_code != 200:
+            logger.error("Groq devolvió %s: %s", response.status_code, response.text)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Groq API error {response.status_code}: {response.text[:300]}",
+            )
+
+        data = response.json()
+        reply = data["choices"][0]["message"]["content"]
+        return ChatResponse(reply=reply, model=GROQ_MODEL)
+
+    except httpx.TimeoutException:
+        logger.exception("Timeout llamando a Groq")
+        raise HTTPException(status_code=504, detail="Tiempo de espera agotado con Groq.")
+    except httpx.RequestError as e:
+        logger.exception("Error de red con Groq")
+        raise HTTPException(status_code=503, detail=f"No se pudo conectar con Groq: {e}")
+    except (KeyError, IndexError) as e:
+        logger.exception("Respuesta de Groq con formato inesperado")
+        raise HTTPException(status_code=502, detail=f"Respuesta inválida de Groq: {e}")
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "model": GROQ_MODEL}
+# ── Static files (DESPUÉS de las rutas API) ──────────────────────────────────
+# Verificamos que el directorio exista antes de montar para evitar crash al arrancar
+if os.path.isdir(STATIC_DIR):
+    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+    logger.info("Static files montados desde: %s", STATIC_DIR)
+else:
+    logger.warning("Directorio static/ no encontrado en %s — el frontend no se servirá", STATIC_DIR)
 
-
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
-
-@app.exception_handler(404)
-async def not_found(request, exc):
-    return FileResponse("static/index.html")
+    @app.get("/")
+    async def root_fallback():
+        return {"status": "ok", "warning": "static/ no encontrado", "api": "/api/chat"}
